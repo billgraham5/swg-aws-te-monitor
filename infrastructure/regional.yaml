@@ -1,0 +1,142 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Regional bundle for Cisco Secure Access / ThousandEyes monitoring locations
+
+Parameters:
+  LocationTemplateUrl: {Type: String}
+  ThousandEyesToken: {Type: String, NoEcho: true}
+  PacUrl: {Type: String, NoEcho: true}
+  BootstrapBucket: {Type: String}
+  SshEnabled: {Type: String, AllowedValues: ['true', 'false']}
+  AdminCidr: {Type: String}
+  KeyPairName: {Type: String}
+  AgentSuffix: {Type: String, Default: ''}
+  Location1Code: {Type: String, Default: ''}
+  Location1Zone: {Type: String, Default: ''}
+  Location1InstanceType: {Type: String, Default: t3.small}
+  Location1EipAllocationId: {Type: String, Default: ''}
+  Location1EipPublicIp: {Type: String, Default: ''}
+  Location1BootstrapKey: {Type: String, Default: ''}
+  Location1BootstrapSha256: {Type: String, Default: ''}
+  Location2Code: {Type: String, Default: ''}
+  Location2Zone: {Type: String, Default: ''}
+  Location2InstanceType: {Type: String, Default: t3.small}
+  Location2EipAllocationId: {Type: String, Default: ''}
+  Location2EipPublicIp: {Type: String, Default: ''}
+  Location2BootstrapKey: {Type: String, Default: ''}
+  Location2BootstrapSha256: {Type: String, Default: ''}
+  Location3Code: {Type: String, Default: ''}
+  Location3Zone: {Type: String, Default: ''}
+  Location3InstanceType: {Type: String, Default: t3.small}
+  Location3EipAllocationId: {Type: String, Default: ''}
+  Location3EipPublicIp: {Type: String, Default: ''}
+  Location3BootstrapKey: {Type: String, Default: ''}
+  Location3BootstrapSha256: {Type: String, Default: ''}
+  Location4Code: {Type: String, Default: ''}
+  Location4Zone: {Type: String, Default: ''}
+  Location4InstanceType: {Type: String, Default: t3.small}
+  Location4EipAllocationId: {Type: String, Default: ''}
+  Location4EipPublicIp: {Type: String, Default: ''}
+  Location4BootstrapKey: {Type: String, Default: ''}
+  Location4BootstrapSha256: {Type: String, Default: ''}
+
+Conditions:
+  HasLocation1: !Not [!Equals [!Ref Location1Code, '']]
+  HasLocation2: !Not [!Equals [!Ref Location2Code, '']]
+  HasLocation3: !Not [!Equals [!Ref Location3Code, '']]
+  HasLocation4: !Not [!Equals [!Ref Location4Code, '']]
+
+Resources:
+  Location1:
+    Type: AWS::CloudFormation::Stack
+    Condition: HasLocation1
+    Properties:
+      TemplateURL: !Ref LocationTemplateUrl
+      Parameters:
+        LocationCode: !Ref Location1Code
+        AvailabilityZone: !Ref Location1Zone
+        AgentSuffix: !Ref AgentSuffix
+        VpcCidr: 10.97.1.0/24
+        InstanceType: !Ref Location1InstanceType
+        EipAllocationId: !Ref Location1EipAllocationId
+        EipPublicIp: !Ref Location1EipPublicIp
+        ThousandEyesToken: !Ref ThousandEyesToken
+        PacUrl: !Ref PacUrl
+        BootstrapBucket: !Ref BootstrapBucket
+        BootstrapKey: !Ref Location1BootstrapKey
+        BootstrapSha256: !Ref Location1BootstrapSha256
+        SshEnabled: !Ref SshEnabled
+        AdminCidr: !Ref AdminCidr
+        KeyPairName: !Ref KeyPairName
+      TimeoutInMinutes: 35
+  Location2:
+    Type: AWS::CloudFormation::Stack
+    Condition: HasLocation2
+    Properties:
+      TemplateURL: !Ref LocationTemplateUrl
+      Parameters:
+        LocationCode: !Ref Location2Code
+        AvailabilityZone: !Ref Location2Zone
+        AgentSuffix: !Ref AgentSuffix
+        VpcCidr: 10.97.2.0/24
+        InstanceType: !Ref Location2InstanceType
+        EipAllocationId: !Ref Location2EipAllocationId
+        EipPublicIp: !Ref Location2EipPublicIp
+        ThousandEyesToken: !Ref ThousandEyesToken
+        PacUrl: !Ref PacUrl
+        BootstrapBucket: !Ref BootstrapBucket
+        BootstrapKey: !Ref Location2BootstrapKey
+        BootstrapSha256: !Ref Location2BootstrapSha256
+        SshEnabled: !Ref SshEnabled
+        AdminCidr: !Ref AdminCidr
+        KeyPairName: !Ref KeyPairName
+      TimeoutInMinutes: 35
+  Location3:
+    Type: AWS::CloudFormation::Stack
+    Condition: HasLocation3
+    Properties:
+      TemplateURL: !Ref LocationTemplateUrl
+      Parameters:
+        LocationCode: !Ref Location3Code
+        AvailabilityZone: !Ref Location3Zone
+        AgentSuffix: !Ref AgentSuffix
+        VpcCidr: 10.97.3.0/24
+        InstanceType: !Ref Location3InstanceType
+        EipAllocationId: !Ref Location3EipAllocationId
+        EipPublicIp: !Ref Location3EipPublicIp
+        ThousandEyesToken: !Ref ThousandEyesToken
+        PacUrl: !Ref PacUrl
+        BootstrapBucket: !Ref BootstrapBucket
+        BootstrapKey: !Ref Location3BootstrapKey
+        BootstrapSha256: !Ref Location3BootstrapSha256
+        SshEnabled: !Ref SshEnabled
+        AdminCidr: !Ref AdminCidr
+        KeyPairName: !Ref KeyPairName
+      TimeoutInMinutes: 35
+  Location4:
+    Type: AWS::CloudFormation::Stack
+    Condition: HasLocation4
+    Properties:
+      TemplateURL: !Ref LocationTemplateUrl
+      Parameters:
+        LocationCode: !Ref Location4Code
+        AvailabilityZone: !Ref Location4Zone
+        AgentSuffix: !Ref AgentSuffix
+        VpcCidr: 10.97.4.0/24
+        InstanceType: !Ref Location4InstanceType
+        EipAllocationId: !Ref Location4EipAllocationId
+        EipPublicIp: !Ref Location4EipPublicIp
+        ThousandEyesToken: !Ref ThousandEyesToken
+        PacUrl: !Ref PacUrl
+        BootstrapBucket: !Ref BootstrapBucket
+        BootstrapKey: !Ref Location4BootstrapKey
+        BootstrapSha256: !Ref Location4BootstrapSha256
+        SshEnabled: !Ref SshEnabled
+        AdminCidr: !Ref AdminCidr
+        KeyPairName: !Ref KeyPairName
+      TimeoutInMinutes: 35
+
+Outputs:
+  LocationCount:
+    Value: !Join
+      - ','
+      - [!Ref Location1Code, !Ref Location2Code, !Ref Location3Code, !Ref Location4Code]

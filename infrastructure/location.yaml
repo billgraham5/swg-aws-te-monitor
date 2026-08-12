@@ -1,0 +1,175 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: One Cisco Secure Access / ThousandEyes monitoring location
+
+Parameters:
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+  LocationCode: {Type: String, AllowedPattern: '^[a-z0-9]{3,5}$'}
+  AvailabilityZone: {Type: String, AllowedPattern: '^[a-z0-9-]+$'}
+  AgentSuffix: {Type: String, Default: '', AllowedPattern: '^$|^[a-z0-9-]{1,12}$'}
+  VpcCidr: {Type: String, Default: 10.97.0.0/24}
+  InstanceType: {Type: String, Default: t3.small}
+  EipAllocationId: {Type: String, AllowedPattern: '^eipalloc-[a-f0-9]+$'}
+  EipPublicIp: {Type: String, AllowedPattern: '^[0-9.]+$'}
+  ThousandEyesToken: {Type: String, NoEcho: true}
+  PacUrl: {Type: String, NoEcho: true}
+  BootstrapBucket: {Type: String}
+  BootstrapKey: {Type: String}
+  BootstrapSha256: {Type: String, AllowedPattern: '^[a-f0-9]{64}$'}
+  SshEnabled: {Type: String, AllowedValues: ['true', 'false'], Default: 'false'}
+  AdminCidr: {Type: String, Default: 127.0.0.1/32}
+  KeyPairName: {Type: String, Default: ''}
+
+Conditions:
+  UseSsh: !Equals [!Ref SshEnabled, 'true']
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{Key: Name, Value: !Sub '${LocationCode}-te-vpc'}]
+  InternetGateway: {Type: 'AWS::EC2::InternetGateway'}
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: {VpcId: !Ref Vpc, InternetGatewayId: !Ref InternetGateway}
+  Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Ref AvailabilityZone
+      CidrBlock: !Ref VpcCidr
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: !Sub '${LocationCode}-te-public'}]
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref Vpc}
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties: {RouteTableId: !Ref RouteTable, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref InternetGateway}
+  RouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {RouteTableId: !Ref RouteTable, SubnetId: !Ref Subnet}
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Outbound-only monitor host; optional restricted SSH
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: HTTPS bootstrap and monitoring}
+        - {IpProtocol: udp, FromPort: 53, ToPort: 53, CidrIp: 0.0.0.0/0, Description: DNS}
+        - {IpProtocol: tcp, FromPort: 53, ToPort: 53, CidrIp: 0.0.0.0/0, Description: DNS TCP}
+        - {IpProtocol: udp, FromPort: 123, ToPort: 123, CidrIp: 0.0.0.0/0, Description: NTP}
+      SecurityGroupIngress: !If
+        - UseSsh
+        - [{IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: !Ref AdminCidr, Description: Restricted administrator SSH}]
+        - !Ref 'AWS::NoValue'
+  AgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      ManagedPolicyArns: ['arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore']
+      Policies:
+        - PolicyName: ReadBootstrap
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['s3:GetObject']
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${BootstrapBucket}/${BootstrapKey}'
+        - PolicyName: AssociateOwnElasticIp
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['ec2:AssociateAddress']
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*'
+                  - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:elastic-ip/${EipAllocationId}'
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: {Roles: [!Ref AgentRole]}
+  AgentInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: [DefaultRoute, RouteAssociation]
+    CreationPolicy: {ResourceSignal: {Count: 1, Timeout: PT30M}}
+    Properties:
+      AvailabilityZone: !Ref AvailabilityZone
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      KeyName: !If [UseSsh, !Ref KeyPairName, !Ref 'AWS::NoValue']
+      SecurityGroupIds: [!Ref SecurityGroup]
+      SubnetId: !Ref Subnet
+      SourceDestCheck: true
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs: {DeleteOnTermination: true, Encrypted: true, VolumeSize: 20, VolumeType: gp2}
+      MetadataOptions: {HttpEndpoint: enabled, HttpTokens: required, HttpPutResponseHopLimit: 1}
+      Tags:
+        - {Key: Name, Value: !Sub '${LocationCode}-aws-te${AgentSuffix}'}
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+          export AWS_REGION='${AWS::Region}'
+          export AWS_DEFAULT_REGION='${AWS::Region}'
+          # The subnet auto-assigns a public IP so the host has egress the moment it
+          # boots; that connectivity is what lets this call reach the EC2 API to swap
+          # in the Cisco-registered Elastic IP, which replaces the auto-assigned
+          # address. Associating the EIP as a CloudFormation resource instead would
+          # deadlock against this instance's cfn-signal.
+          TOKEN=$(curl -sS -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
+          INSTANCE_ID=$(curl -sS -H "X-aws-ec2-metadata-token: $TOKEN" "http://169.254.169.254/latest/meta-data/instance-id")
+          for attempt in $(seq 1 12); do
+            if aws ec2 associate-address --instance-id "$INSTANCE_ID" --allocation-id '${EipAllocationId}' --region '${AWS::Region}' --allow-reassociation; then
+              break
+            fi
+            sleep 5
+          done
+          # Do not continue on the auto-assigned address: everything after this point
+          # (PAC fetch, agent registration) must egress from the Cisco-registered IP.
+          for attempt in $(seq 1 12); do
+            TOKEN=$(curl -sS -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
+            CURRENT_IP=$(curl -sS -H "X-aws-ec2-metadata-token: $TOKEN" "http://169.254.169.254/latest/meta-data/public-ipv4" || echo '')
+            if [ "$CURRENT_IP" = '${EipPublicIp}' ]; then
+              break
+            fi
+            sleep 5
+          done
+          for attempt in $(seq 1 12); do
+            if dnf install -y aws-cfn-bootstrap; then
+              break
+            fi
+            sleep 5
+          done
+          rpm -q aws-cfn-bootstrap
+          install -d -m 0700 /etc/swg-te-monitor /var/lib/swg-te-monitor
+          cat >/etc/swg-te-monitor/bootstrap.env <<'CONFIG'
+          AWS_REGION=${AWS::Region}
+          THOUSANDEYES_TOKEN=${ThousandEyesToken}
+          PAC_URL=${PacUrl}
+          AGENT_NAME=${LocationCode}-aws-te${AgentSuffix}
+          ADMIN_CIDR=${AdminCidr}
+          CONFIG
+          chmod 0600 /etc/swg-te-monitor/bootstrap.env
+          aws s3 cp 's3://${BootstrapBucket}/${BootstrapKey}' /usr/local/sbin/swg-te-bootstrap
+          echo '${BootstrapSha256}  /usr/local/sbin/swg-te-bootstrap' | sha256sum -c -
+          chmod 0750 /usr/local/sbin/swg-te-bootstrap
+          set +e
+          /usr/local/sbin/swg-te-bootstrap
+          bootstrap_rc=$?
+          set -e
+          /opt/aws/bin/cfn-signal -e "$bootstrap_rc" --stack '${AWS::StackName}' --resource AgentInstance --region '${AWS::Region}'
+          exit "$bootstrap_rc"
+Outputs:
+  InstanceId: {Value: !Ref AgentInstance}
+  AvailabilityZone: {Value: !Ref AvailabilityZone}
+  AgentName: {Value: !Sub '${LocationCode}-aws-te${AgentSuffix}'}
+  SessionManagerCommand: {Value: !Sub 'aws ssm start-session --target ${AgentInstance} --region ${AWS::Region}'}

@@ -1,0 +1,12 @@
+aws_profile: default
+locations:
+  - northern-virginia
+  - denver
+thousandeyes_token: <THOUSANDEYES_INSTALLATION_TOKEN>
+pac_url: <CISCO_SECURE_ACCESS_PAC_URL>
+ssh_enabled: false
+instance_type: t3.small
+browserbot: false
+vpc_cidr: 10.97.0.0/24
+tags:
+  CostCenter: <COST_CENTER>

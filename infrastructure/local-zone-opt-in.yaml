@@ -1,0 +1,136 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Enable selected AWS Local Zone groups before the monitoring StackSet rollout
+
+Parameters:
+  ZoneTargets:
+    Type: CommaDelimitedList
+    Description: Entries formatted as parent-region|local-zone-group
+
+Resources:
+  OptInRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LocalZoneOptIn
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeAvailabilityZones
+                  - ec2:ModifyAvailabilityZoneGroup
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+  OptInFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt OptInRole.Arn
+      MemorySize: 128
+      Timeout: 600
+      Architectures: [arm64]
+      Code:
+        ZipFile: |
+          import json
+          import time
+          import urllib.request
+
+          import boto3
+
+
+          def respond(event, context, status, reason, data=None):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": reason[:1024],
+                  "PhysicalResourceId": event.get("PhysicalResourceId", "local-zone-opt-in"),
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "NoEcho": False,
+                  "Data": data or {},
+              }).encode()
+              request = urllib.request.Request(
+                  event["ResponseURL"],
+                  data=body,
+                  method="PUT",
+                  headers={"content-type": "", "content-length": str(len(body))},
+              )
+              with urllib.request.urlopen(request, timeout=10):
+                  pass
+
+
+          def zone_group(ec2, group_name):
+              response = ec2.describe_availability_zones(
+                  AllAvailabilityZones=True,
+                  Filters=[{"Name": "group-name", "Values": [group_name]}],
+              )
+              zones = response.get("AvailabilityZones", [])
+              if not zones:
+                  raise RuntimeError(
+                      f"Local Zone group {group_name} is not visible to this account; "
+                      "the location may require AWS Support access"
+                  )
+              return zones
+
+
+          def enable_target(target):
+              region, group_name = target.split("|", 1)
+              ec2 = boto3.client("ec2", region_name=region)
+              zones = zone_group(ec2, group_name)
+              if any(zone.get("OptInStatus") == "not-opted-in" for zone in zones):
+                  result = ec2.modify_availability_zone_group(
+                      GroupName=group_name,
+                      OptInStatus="opted-in",
+                  )
+                  if not result.get("Return"):
+                      raise RuntimeError(f"AWS did not accept opt-in for {group_name}")
+              deadline = time.monotonic() + 480
+              while time.monotonic() < deadline:
+                  zones = zone_group(ec2, group_name)
+                  if any(
+                      zone.get("OptInStatus") == "opted-in"
+                      and zone.get("State") == "available"
+                      for zone in zones
+                  ):
+                      return {"region": region, "group": group_name, "status": "opted-in"}
+                  time.sleep(10)
+              raise RuntimeError(f"Timed out waiting for {group_name} to become available")
+
+
+          def handler(event, context):
+              try:
+                  if event["RequestType"] == "Delete":
+                      respond(event, context, "SUCCESS", "Opt-in is intentionally retained")
+                      return
+                  raw_targets = event["ResourceProperties"].get("Targets", [])
+                  targets = sorted(set(item for item in raw_targets if item))
+                  results = [enable_target(target) for target in targets]
+                  respond(event, context, "SUCCESS", "Selected Local Zones are available", {"Results": results})
+              except Exception as exc:
+                  respond(event, context, "FAILED", f"Local Zone opt-in failed: {type(exc).__name__}: {exc}")
+  OptInLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${OptInFunction}'
+      RetentionInDays: 7
+  EnableLocalZones:
+    Type: Custom::LocalZoneOptIn
+    DependsOn: OptInLogGroup
+    Properties:
+      ServiceToken: !GetAtt OptInFunction.Arn
+      Targets: !Ref ZoneTargets
+
+Outputs:
+  OptInFunctionName: {Value: !Ref OptInFunction}
+  EnabledTargets: {Value: !Join [',', !Ref ZoneTargets]}

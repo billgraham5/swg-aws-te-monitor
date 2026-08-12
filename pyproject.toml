@@ -1,0 +1,61 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "swg-aws-te-monitor"
+version = "0.1.0"
+description = "Deploy ThousandEyes Enterprise Agents near Cisco Secure Access SWG locations"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "boto3>=1.35,<2",
+  "botocore>=1.35,<2",
+  "pydantic>=2.9,<3",
+  "PyYAML>=6.0.2,<7",
+  "questionary>=2.1,<3",
+  "rich>=13.9,<15",
+  "typer>=0.15,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "bandit>=1.8,<2",
+  "cfn-lint>=1.22,<2",
+  "mypy>=1.13,<2",
+  "pytest>=8.3,<9",
+  "pytest-cov>=6,<7",
+  "ruff>=0.9,<1",
+  "types-PyYAML>=6.0.12",
+]
+
+[project.scripts]
+swg-te-monitor = "swg_te_monitor.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/swg_te_monitor"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
+"src/swg_te_monitor/cli.py" = ["B008"]
+"bootstrap/bootstrap.py" = ["UP042"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["swg_te_monitor"]
+
+[[tool.mypy.overrides]]
+module = ["boto3", "botocore.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+addopts = "--cov=swg_te_monitor --cov-report=term-missing --strict-markers"
+testpaths = ["tests"]
