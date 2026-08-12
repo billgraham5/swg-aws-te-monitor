@@ -9,6 +9,7 @@ from swg_te_monitor.aws import (
     ResolvedTarget,
     _regional_parameters,
     _select_instance_type,
+    _smallest_supported_type,
     _stack_parameters,
 )
 from swg_te_monitor.locations import LOCATIONS
@@ -456,14 +457,69 @@ def test_wait_stackset_idle_raises_when_never_settles(monkeypatch: pytest.Monkey
 
 
 def test_instance_selection_uses_affordable_offering() -> None:
-    assert _select_instance_type("t3.small", {"t3.medium", "t2.medium"}) == (
-        "t3.medium",
-        False,
+    assert _select_instance_type("t3.small", {"t3.medium", "t2.medium"}) == "t3.medium"
+
+
+def test_instance_selection_reports_when_the_zone_offers_no_preferred_type() -> None:
+    """No preferred type must not become a guess.
+
+    Returning a hard-coded type here launched an instance type the zone does
+    not offer, which EC2 rejects only at create time with "The requested
+    configuration is currently not supported".
+    """
+    assert _select_instance_type("t3.small", {"c6i.large", "m6i.large"}) is None
+
+
+def test_smallest_supported_type_skips_arm_and_undersized_offerings() -> None:
+    """Pick by what actually boots: the image is x86_64, and BrowserBot needs room.
+
+    The Dallas Local Zone's smallest offering by memory is Graviton, so size
+    alone would choose a type the pinned image cannot run.
+    """
+    ec2 = Mock()
+    ec2.describe_instance_types.return_value = {
+        "InstanceTypes": [
+            {
+                "InstanceType": "c6gn.medium",
+                "ProcessorInfo": {"SupportedArchitectures": ["arm64"]},
+                "VCpuInfo": {"DefaultVCpus": 1},
+                "MemoryInfo": {"SizeInMiB": 2048},
+            },
+            {
+                "InstanceType": "c6i.large",
+                "ProcessorInfo": {"SupportedArchitectures": ["x86_64"]},
+                "VCpuInfo": {"DefaultVCpus": 2},
+                "MemoryInfo": {"SizeInMiB": 4096},
+            },
+            {
+                "InstanceType": "m6i.large",
+                "ProcessorInfo": {"SupportedArchitectures": ["x86_64"]},
+                "VCpuInfo": {"DefaultVCpus": 2},
+                "MemoryInfo": {"SizeInMiB": 8192},
+            },
+        ]
+    }
+
+    assert _smallest_supported_type(ec2, {"c6gn.medium", "c6i.large", "m6i.large"}, 4.0) == (
+        "c6i.large",
+        4.0,
     )
 
 
-def test_instance_selection_allows_cloudformation_final_check() -> None:
-    assert _select_instance_type("t3.small", set()) == ("t3.medium", True)
+def test_smallest_supported_type_returns_none_when_nothing_qualifies() -> None:
+    ec2 = Mock()
+    ec2.describe_instance_types.return_value = {
+        "InstanceTypes": [
+            {
+                "InstanceType": "c6gn.medium",
+                "ProcessorInfo": {"SupportedArchitectures": ["arm64"]},
+                "VCpuInfo": {"DefaultVCpus": 1},
+                "MemoryInfo": {"SizeInMiB": 2048},
+            }
+        ]
+    }
+
+    assert _smallest_supported_type(ec2, {"c6gn.medium"}, 4.0) is None
 
 
 def test_missing_execution_role_is_created_without_replacing_admin_role() -> None:

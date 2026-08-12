@@ -116,14 +116,23 @@ class AwsFacade:
                     f"AWS reports these affordable options in {target.zone_name}: "
                     f"{', '.join(matched) if matched else 'none'}."
                 )
-                selected_type, discovery_overridden = _select_instance_type(
-                    config.instance_type, offered
-                )
-                if discovery_overridden:
+                selected_type = _select_instance_type(config.instance_type, offered)
+                if selected_type is None:
+                    # BrowserBot needs headroom beyond the 2 GiB the agent alone
+                    # wants, which is why t3.small is rejected for it elsewhere.
+                    minimum_gib = 4.0 if config.browserbot else 2.0
+                    fallback = _smallest_supported_type(ec2, offered, minimum_gib)
+                    if fallback is None:
+                        raise PreflightError(
+                            f"{target.zone_name} offers no x86_64 instance type with at least "
+                            f"{minimum_gib:g} GiB of memory, so {target.location.label} cannot be "
+                            "deployed there with the current image."
+                        )
+                    selected_type, selected_gib = fallback
                     self.reporter(
-                        f"WARNING: EC2 discovery did not return an affordable type for "
-                        f"{target.zone_name}. Attempting t3.medium because CloudFormation's "
-                        f"instance launch is the final availability check."
+                        f"{target.zone_name} offers none of {', '.join(candidates)}; using the "
+                        f"smallest suitable type it does offer, {selected_type} "
+                        f"({selected_gib:g} GiB)."
                     )
                 if selected_type != config.instance_type:
                     self.reporter(
@@ -785,12 +794,38 @@ class AwsFacade:
         raise RuntimeError(f"StackSet operation {operation_id} timed out")
 
 
-def _select_instance_type(requested: str, offered: set[str]) -> tuple[str, bool]:
+def _select_instance_type(requested: str, offered: set[str]) -> str | None:
+    """Return the first preferred type the zone offers, or None if it offers none."""
     candidates = list(dict.fromkeys((requested, *INSTANCE_TYPE_CANDIDATES)))
-    selected = next(
-        (instance_type for instance_type in candidates if instance_type in offered), None
-    )
-    return (selected, False) if selected is not None else ("t3.medium", True)
+    return next((instance_type for instance_type in candidates if instance_type in offered), None)
+
+
+def _smallest_supported_type(
+    ec2: Any, offered: set[str], minimum_gib: float, architecture: str = "x86_64"
+) -> tuple[str, float] | None:
+    """Return the smallest offered type that can actually run the agent.
+
+    Some zones offer nothing from the preferred list -- the Dallas Local Zone
+    offers no burstable type at all -- so the choice has to come from what is
+    really there. Architecture matters as much as size: that zone's smallest
+    offering by memory is Graviton, which cannot boot the x86_64 image this
+    project pins.
+    """
+    usable: list[tuple[int, float, str]] = []
+    types = sorted(offered)
+    for start in range(0, len(types), 100):
+        described = ec2.describe_instance_types(InstanceTypes=types[start : start + 100])
+        for item in described["InstanceTypes"]:
+            if architecture not in item["ProcessorInfo"]["SupportedArchitectures"]:
+                continue
+            gib = item["MemoryInfo"]["SizeInMiB"] / 1024
+            if gib + 1e-9 < minimum_gib:
+                continue
+            usable.append((item["VCpuInfo"]["DefaultVCpus"], gib, item["InstanceType"]))
+    if not usable:
+        return None
+    vcpus, gib, name = min(usable)
+    return name, gib
 
 
 def _stack_parameters(config: DeploymentConfig, target: ResolvedTarget) -> list[dict[str, str]]:
