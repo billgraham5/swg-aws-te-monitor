@@ -1,0 +1,258 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Powers the monitoring fleet down overnight and at weekends. Deployed and
+  deleted independently of the monitoring StackSet; deleting it leaves every
+  instance running.
+
+Parameters:
+  Regions:
+    Type: CommaDelimitedList
+    Default: us-east-1,us-east-2,us-west-1,us-west-2
+    Description: Regions to act on. Others are not looked at.
+  AgentNamePattern:
+    Type: String
+    Default: '*-aws-te*'
+    Description: Name tag of the on-demand agents, which are stopped and started.
+  ProjectTag:
+    Type: String
+    Default: swg-te-monitor
+    Description: Project tag of the Auto Scaling groups, whose capacity is scaled instead.
+  StartExpression:
+    Type: String
+    Default: cron(0 7 ? * MON-FRI *)
+  StopExpression:
+    Type: String
+    Default: cron(0 21 ? * MON-FRI *)
+  Timezone:
+    Type: String
+    Default: America/New_York
+    Description: Named zone, so the local time holds across daylight saving changes.
+
+Resources:
+  SchedulerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: FunctionLogGroup
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-power'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 300
+      MemorySize: 256
+      Architectures: [arm64]
+      Role: !GetAtt FunctionRole.Arn
+      Environment:
+        Variables:
+          REGIONS: !Join [',', !Ref Regions]
+          AGENT_NAME_PATTERN: !Ref AgentNamePattern
+          PROJECT_TAG: !Ref ProjectTag
+      Code:
+        ZipFile: |
+          import os
+
+          import boto3
+
+          # An Auto Scaling group replaces anything stopped underneath it, and a
+          # one-time Spot request cannot be stopped at all, so capacity is scaled
+          # to zero instead. The capacity to come back to is kept on the group,
+          # because it is not knowable once desired capacity reads zero.
+          RESTORE_TAG = "swg:scheduler-restore-capacity"
+
+
+          def agent_instance_ids(ec2, pattern):
+              ids = []
+              paginator = ec2.get_paginator("describe_instances")
+              pages = paginator.paginate(
+                  Filters=[
+                      {"Name": "tag:Name", "Values": [pattern]},
+                      {"Name": "instance-state-name", "Values": ["running", "stopped"]},
+                  ]
+              )
+              for page in pages:
+                  for reservation in page["Reservations"]:
+                      for instance in reservation["Instances"]:
+                          tags = {t["Key"]: t["Value"] for t in instance.get("Tags", [])}
+                          # Leave anything an Auto Scaling group owns to the group.
+                          if "aws:autoscaling:groupName" in tags:
+                              continue
+                          ids.append(instance["InstanceId"])
+              return ids
+
+
+          def project_groups(autoscaling, project):
+              groups = []
+              for page in autoscaling.get_paginator("describe_auto_scaling_groups").paginate():
+                  for group in page["AutoScalingGroups"]:
+                      tags = {t["Key"]: t["Value"] for t in group.get("Tags", [])}
+                      if tags.get("Project") == project:
+                          groups.append(group)
+              return groups
+
+
+          def scale_down(autoscaling, group):
+              name = group["AutoScalingGroupName"]
+              desired = group["DesiredCapacity"]
+              if desired == 0 and group["MinSize"] == 0:
+                  return f"{name}: already at zero"
+              # Record where to return to before the current value is lost.
+              autoscaling.create_or_update_tags(
+                  Tags=[
+                      {
+                          "ResourceId": name,
+                          "ResourceType": "auto-scaling-group",
+                          "Key": RESTORE_TAG,
+                          "Value": str(max(desired, group["MinSize"], 1)),
+                          "PropagateAtLaunch": False,
+                      }
+                  ]
+              )
+              autoscaling.update_auto_scaling_group(
+                  AutoScalingGroupName=name, MinSize=0, DesiredCapacity=0
+              )
+              return f"{name}: scaled to 0"
+
+
+          def scale_up(autoscaling, group):
+              name = group["AutoScalingGroupName"]
+              tags = {t["Key"]: t["Value"] for t in group.get("Tags", [])}
+              try:
+                  restore = int(tags.get(RESTORE_TAG, "1"))
+              except ValueError:
+                  restore = 1
+              restore = min(max(restore, 1), group["MaxSize"] or 1)
+              if group["DesiredCapacity"] >= restore and group["MinSize"] >= restore:
+                  return f"{name}: already at {restore}"
+              autoscaling.update_auto_scaling_group(
+                  AutoScalingGroupName=name, MinSize=restore, DesiredCapacity=restore
+              )
+              return f"{name}: scaled to {restore}"
+
+
+          def handler(event, context):
+              action = (event or {}).get("action", "").lower()
+              if action not in {"start", "stop"}:
+                  raise ValueError("event must set action to 'start' or 'stop'")
+              pattern = os.environ["AGENT_NAME_PATTERN"]
+              project = os.environ["PROJECT_TAG"]
+              results = []
+              for region in [r.strip() for r in os.environ["REGIONS"].split(",") if r.strip()]:
+                  ec2 = boto3.client("ec2", region_name=region)
+                  autoscaling = boto3.client("autoscaling", region_name=region)
+
+                  instance_ids = agent_instance_ids(ec2, pattern)
+                  if instance_ids:
+                      if action == "stop":
+                          ec2.stop_instances(InstanceIds=instance_ids)
+                      else:
+                          ec2.start_instances(InstanceIds=instance_ids)
+                      results.append(f"{region}: {action} {len(instance_ids)} instance(s)")
+
+                  for group in project_groups(autoscaling, project):
+                      if action == "stop":
+                          results.append(f"{region}: " + scale_down(autoscaling, group))
+                      else:
+                          results.append(f"{region}: " + scale_up(autoscaling, group))
+
+              # Surfaced in the log so a run that matched nothing is visible rather
+              # than looking like success.
+              summary = results or ["nothing matched in any region"]
+              for line in summary:
+                  print(line)
+              return {"action": action, "results": summary}
+
+  FunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-power'
+      RetentionInDays: 14
+
+  FunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: SchedulePower
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Describe calls cannot be scoped to a resource.
+              - Effect: Allow
+                Action:
+                  - 'ec2:DescribeInstances'
+                  - 'autoscaling:DescribeAutoScalingGroups'
+                Resource: '*'
+              - Effect: Allow
+                Action: ['ec2:StartInstances', 'ec2:StopInstances']
+                Resource: !Sub 'arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:instance/*'
+              - Effect: Allow
+                Action:
+                  - 'autoscaling:UpdateAutoScalingGroup'
+                  - 'autoscaling:CreateOrUpdateTags'
+                Resource: '*'
+              - Effect: Allow
+                Action: ['logs:CreateLogStream', 'logs:PutLogEvents']
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-power:*'
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: scheduler.amazonaws.com}
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals: {'aws:SourceAccount': !Ref 'AWS::AccountId'}
+      Policies:
+        - PolicyName: InvokeSchedulerFunction
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 'lambda:InvokeFunction'
+                Resource: !GetAtt SchedulerFunction.Arn
+
+  StartSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub '${AWS::StackName}-start'
+      Description: Bring the monitoring fleet back up for the working day
+      ScheduleExpression: !Ref StartExpression
+      ScheduleExpressionTimezone: !Ref Timezone
+      FlexibleTimeWindow: {Mode: 'OFF'}
+      State: ENABLED
+      Target:
+        Arn: !GetAtt SchedulerFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"action":"start"}'
+        RetryPolicy: {MaximumRetryAttempts: 3, MaximumEventAgeInSeconds: 3600}
+
+  StopSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub '${AWS::StackName}-stop'
+      Description: Power the monitoring fleet down overnight and into the weekend
+      ScheduleExpression: !Ref StopExpression
+      ScheduleExpressionTimezone: !Ref Timezone
+      FlexibleTimeWindow: {Mode: 'OFF'}
+      State: ENABLED
+      Target:
+        Arn: !GetAtt SchedulerFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"action":"stop"}'
+        RetryPolicy: {MaximumRetryAttempts: 3, MaximumEventAgeInSeconds: 3600}
+
+Outputs:
+  FunctionName:
+    Value: !Ref SchedulerFunction
+  DryRunStart:
+    Description: Run the start action by hand
+    Value: !Sub 'aws lambda invoke --function-name ${SchedulerFunction} --payload ''{"action":"start"}'' --cli-binary-format raw-in-base64-out --region ${AWS::Region} /dev/stdout'
+  DryRunStop:
+    Description: Run the stop action by hand
+    Value: !Sub 'aws lambda invoke --function-name ${SchedulerFunction} --payload ''{"action":"stop"}'' --cli-binary-format raw-in-base64-out --region ${AWS::Region} /dev/stdout'
