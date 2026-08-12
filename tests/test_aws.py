@@ -7,6 +7,7 @@ from swg_te_monitor.aws import (
     AwsFacade,
     PreflightError,
     ResolvedTarget,
+    _deployed_regional_values,
     _regional_parameters,
     _select_instance_type,
     _smallest_supported_type,
@@ -625,3 +626,38 @@ def test_home_region_uses_the_only_stackset_for_an_unmanaged_region() -> None:
 
 def test_home_region_falls_back_to_a_fixed_default_when_none_exists() -> None:
     assert _facade_with_stacksets({}).home_region(("us-east-2",)) == "us-east-1"
+
+
+def test_deployed_values_ignores_a_stack_that_is_not_standing() -> None:
+    """A failed or deleted stack's parameters must not be carried forward.
+
+    CloudFormation still answers for a deleted stack. Its parameters describe
+    an attempt that did not work, so carrying them forward re-creates a
+    location that never deployed with the settings that failed it -- and one
+    failed slot rolls back the whole Region, taking the locations being
+    deployed alongside it.
+    """
+    for status in ("DELETE_COMPLETE", "ROLLBACK_COMPLETE", "CREATE_FAILED", "DELETE_IN_PROGRESS"):
+        cfn = Mock()
+        cfn.describe_stacks.return_value = {
+            "Stacks": [
+                {
+                    "StackStatus": status,
+                    "Parameters": [{"ParameterKey": "Location1Code", "ParameterValue": "dfw"}],
+                }
+            ]
+        }
+        assert _deployed_regional_values(cfn, "stack-id") == {}, status
+
+
+def test_deployed_values_are_read_from_a_standing_stack() -> None:
+    cfn = Mock()
+    cfn.describe_stacks.return_value = {
+        "Stacks": [
+            {
+                "StackStatus": "CREATE_COMPLETE",
+                "Parameters": [{"ParameterKey": "Location1Code", "ParameterValue": "den"}],
+            }
+        ]
+    }
+    assert _deployed_regional_values(cfn, "stack-id") == {"Location1Code": "den"}

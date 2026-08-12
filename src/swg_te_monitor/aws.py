@@ -944,11 +944,24 @@ def _regional_parameters(
     return [{"ParameterKey": key, "ParameterValue": value} for key, value in values.items()]
 
 
+LIVE_STACK_STATUSES = frozenset({"CREATE_COMPLETE", "UPDATE_COMPLETE", "UPDATE_ROLLBACK_COMPLETE"})
+
+
 def _deployed_regional_values(cfn: Any, stack_id: str) -> dict[str, str]:
-    """Read the parameters a region's bundle stack is currently deployed with."""
+    """Read the parameters a region's bundle stack is currently deployed with.
+
+    Only a stack that is actually standing has values worth carrying forward.
+    CloudFormation still answers for a deleted or failed stack, and its
+    parameters describe an attempt that did not work -- carrying those forward
+    re-creates a location that never deployed, using the settings that failed
+    it, and one failed slot rolls back the whole Region including the locations
+    being deployed alongside it.
+    """
     try:
         stack = cfn.describe_stacks(StackName=stack_id)["Stacks"][0]
     except ClientError:
+        return {}
+    if stack.get("StackStatus") not in LIVE_STACK_STATUSES:
         return {}
     return {
         parameter["ParameterKey"]: parameter.get("ParameterValue", "")
