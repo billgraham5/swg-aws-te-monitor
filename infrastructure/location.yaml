@@ -143,6 +143,35 @@ Resources:
             fi
             sleep 5
           done
+          # Pin DNS to a fixed public resolver so every host in the fleet
+          # resolves identically regardless of which Region or Local Zone it
+          # lands in. Results from these hosts are only comparable with each
+          # other if the name lookups behind them are. Domains=~. makes this
+          # global setting win over the DHCP-supplied per-link servers, which
+          # systemd-resolved prefers by default.
+          install -d -m 0755 /etc/systemd/resolved.conf.d
+          cat >/etc/systemd/resolved.conf.d/10-swg-resolver.conf <<'RESOLVED'
+          [Resolve]
+          DNS=208.67.222.222 208.67.220.220
+          Domains=~.
+          RESOLVED
+          systemctl restart systemd-resolved
+          # Prove name resolution still works before depending on it. An
+          # unreachable resolver would cost SSM and leave the host unmanageable,
+          # so revert rather than strand it.
+          resolver_ok=0
+          for attempt in $(seq 1 12); do
+            if getent hosts checkip.amazonaws.com >/dev/null 2>&1; then
+              resolver_ok=1
+              break
+            fi
+            sleep 5
+          done
+          if [ "$resolver_ok" -ne 1 ]; then
+            rm -f /etc/systemd/resolved.conf.d/10-swg-resolver.conf
+            systemctl restart systemd-resolved
+            echo "OpenDNS unreachable; reverted to the DHCP resolver" >&2
+          fi
           for attempt in $(seq 1 12); do
             if dnf install -y aws-cfn-bootstrap; then
               break
