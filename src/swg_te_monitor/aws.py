@@ -35,6 +35,10 @@ class ResolvedTarget:
     instance_type: str = "t3.small"
     eip_allocation_id: str | None = None
     eip_public_ip: str | None = None
+    # Set when the zone offered none of the preferred burstable types and a
+    # larger, costlier one had to be chosen, so the operator can be asked first.
+    substituted_instance_type: bool = False
+    instance_memory_gib: float | None = None
 
 
 class AwsFacade:
@@ -117,6 +121,7 @@ class AwsFacade:
                     f"{', '.join(matched) if matched else 'none'}."
                 )
                 selected_type = _select_instance_type(config.instance_type, offered)
+                substituted, memory_gib = False, None
                 if selected_type is None:
                     # BrowserBot needs headroom beyond the 2 GiB the agent alone
                     # wants, which is why t3.small is rejected for it elsewhere.
@@ -129,6 +134,7 @@ class AwsFacade:
                             "deployed there with the current image."
                         )
                     selected_type, selected_gib = fallback
+                    substituted, memory_gib = True, selected_gib
                     self.reporter(
                         f"{target.zone_name} offers none of {', '.join(candidates)}; using the "
                         f"smallest suitable type it does offer, {selected_type} "
@@ -145,6 +151,8 @@ class AwsFacade:
                     zone_type=target.zone_type,
                     opt_in_status=target.opt_in_status,
                     instance_type=selected_type,
+                    substituted_instance_type=substituted,
+                    instance_memory_gib=memory_gib,
                 )
                 targets[target_index] = target
                 self.session.client("ssm", region_name=target.location.region).get_parameter(
@@ -287,6 +295,8 @@ class AwsFacade:
                     instance_type=target.instance_type,
                     eip_allocation_id=allocation_id,
                     eip_public_ip=public_ip,
+                    substituted_instance_type=target.substituted_instance_type,
+                    instance_memory_gib=target.instance_memory_gib,
                 )
             )
         return resolved
