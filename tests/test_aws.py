@@ -637,7 +637,7 @@ def test_deployed_values_ignores_a_stack_that_is_not_standing() -> None:
     failed slot rolls back the whole Region, taking the locations being
     deployed alongside it.
     """
-    for status in ("DELETE_COMPLETE", "ROLLBACK_COMPLETE", "CREATE_FAILED", "DELETE_IN_PROGRESS"):
+    for status in ("DELETE_COMPLETE", "ROLLBACK_COMPLETE", "CREATE_FAILED"):
         cfn = Mock()
         cfn.describe_stacks.return_value = {
             "Stacks": [
@@ -661,3 +661,64 @@ def test_deployed_values_are_read_from_a_standing_stack() -> None:
         ]
     }
     assert _deployed_regional_values(cfn, "stack-id") == {"Location1Code": "den"}
+
+
+def test_a_stack_in_cleanup_is_still_standing() -> None:
+    """Regression: a cleanup status is a live stack, not a missing one.
+
+    An update that has reached its new state and is only discarding replaced
+    resources reports *_CLEANUP_IN_PROGRESS. Reading that as "nothing
+    deployed" returns no values to carry forward, which blanks every slot the
+    deployment did not name and deletes the locations running in them. This
+    terminated a running production agent once already.
+    """
+    for status in (
+        "UPDATE_COMPLETE_CLEANUP_IN_PROGRESS",
+        "UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS",
+    ):
+        cfn = Mock()
+        cfn.describe_stacks.return_value = {
+            "Stacks": [
+                {
+                    "StackStatus": status,
+                    "Parameters": [{"ParameterKey": "Location3Code", "ParameterValue": "iad"}],
+                }
+            ]
+        }
+        assert _deployed_regional_values(cfn, "stack-id") == {"Location3Code": "iad"}, status
+
+
+def test_an_in_progress_stack_is_waited_out_rather_than_blanked() -> None:
+    """A stack mid-move is not readable, so settle first and then read it."""
+    cfn = Mock()
+    cfn.describe_stacks.side_effect = [
+        {"Stacks": [{"StackStatus": "UPDATE_IN_PROGRESS", "Parameters": []}]},
+        {
+            "Stacks": [
+                {
+                    "StackStatus": "UPDATE_COMPLETE",
+                    "Parameters": [{"ParameterKey": "Location3Code", "ParameterValue": "iad"}],
+                }
+            ]
+        },
+    ]
+    assert _deployed_regional_values(cfn, "stack-id", delay=0) == {"Location3Code": "iad"}
+
+
+def test_an_unreadable_stack_refuses_instead_of_returning_nothing() -> None:
+    """Failing closed costs a re-run; returning {} costs a running agent."""
+    cfn = Mock()
+    cfn.describe_stacks.return_value = {
+        "Stacks": [{"StackStatus": "UPDATE_IN_PROGRESS", "Parameters": []}]
+    }
+    with pytest.raises(RuntimeError, match="still in progress"):
+        _deployed_regional_values(cfn, "stack-id", attempts=3, delay=0)
+
+
+def test_an_unrecognised_status_refuses_rather_than_guessing() -> None:
+    cfn = Mock()
+    cfn.describe_stacks.return_value = {
+        "Stacks": [{"StackStatus": "REVIEW_IN_PROGRESS_SOMETHING_NEW", "Parameters": []}]
+    }
+    with pytest.raises(RuntimeError, match="not a state this can safely carry"):
+        _deployed_regional_values(cfn, "stack-id", attempts=1, delay=0)

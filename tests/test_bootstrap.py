@@ -68,3 +68,60 @@ def test_check_proxy_reachable_retries_and_raises_actionable_message(
         "The SWG proxy is not reachable. Please check that each EIP is provisioned "
         "as a Registered Network in Cisco Secure Access."
     )
+
+
+def test_public_ip_uses_aws_metadata_when_it_answers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The EC2 path must keep working unchanged now that GCP shares the function."""
+    monkeypatch.setattr(bootstrap, "_aws_public_ip", lambda: "52.207.21.25")
+    monkeypatch.setattr(
+        bootstrap, "_gcp_public_ip", lambda: pytest.fail("GCP must not be consulted on EC2")
+    )
+    monkeypatch.setattr(
+        bootstrap, "METADATA_PROVIDERS", (bootstrap._aws_public_ip, bootstrap._gcp_public_ip)
+    )
+    assert str(bootstrap.native_public_ip()) == "52.207.21.25"
+
+
+def test_public_ip_falls_back_to_gcp_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    """On GCP the EC2 token endpoint does not exist, so the next provider answers."""
+
+    def no_aws() -> str:
+        raise OSError("metadata service not found")
+
+    monkeypatch.setattr(bootstrap, "_aws_public_ip", no_aws)
+    monkeypatch.setattr(bootstrap, "_gcp_public_ip", lambda: "34.174.205.53")
+    monkeypatch.setattr(bootstrap, "METADATA_PROVIDERS", (no_aws, bootstrap._gcp_public_ip))
+    monkeypatch.setattr(bootstrap.time, "sleep", lambda _seconds: None)
+    assert str(bootstrap.native_public_ip()) == "34.174.205.53"
+
+
+def test_public_ip_retries_then_reports_no_address(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A slow association is retried; exhausting every attempt is a hard failure."""
+    attempts: list[int] = []
+
+    def never() -> str:
+        attempts.append(1)
+        raise OSError("not ready")
+
+    sleeps: list[int] = []
+    monkeypatch.setattr(bootstrap, "METADATA_PROVIDERS", (never,))
+    monkeypatch.setattr(bootstrap.time, "sleep", lambda seconds: sleeps.append(seconds))
+    with pytest.raises(RuntimeError, match="no public IPv4 address"):
+        bootstrap.native_public_ip()
+    assert len(attempts) == 12
+    assert sleeps == [5] * 11
+
+
+def test_run_reports_stderr_so_a_failure_can_be_diagnosed() -> None:
+    """A bare exit code is not diagnosable from the console; the tail must survive."""
+    with pytest.raises(RuntimeError, match="Unsupported operating system"):
+        bootstrap.run(["/bin/sh", "-c", "echo 'Unsupported operating system' >&2; exit 1"])
+
+
+def test_redact_removes_the_token_and_urls() -> None:
+    """Vendor stderr is echoed to the console, so it must not carry the token."""
+    text = "installer failed for https://proxy.example.invalid/p.pac using tok3nvalue"
+    cleaned = bootstrap.redact(text, "tok3nvalue")
+    assert "tok3nvalue" not in cleaned
+    assert "proxy.example.invalid" not in cleaned
+    assert "<REDACTED_TOKEN>" in cleaned and "<REDACTED_URL>" in cleaned

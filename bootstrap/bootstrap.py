@@ -11,7 +11,6 @@ import subprocess  # nosec B404
 import sys
 import time
 import traceback
-import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from enum import Enum
@@ -37,6 +36,19 @@ class Settings:
     thousandeyes_token: str
     pac_url: str
     agent_name: str
+
+
+def redact(text: str, secret: str) -> str:
+    """Strip secrets from a string before it is written somewhere readable.
+
+    Failure detail now carries the tail of a vendor script's stderr, which is
+    not under our control and can echo back the arguments it was given, so the
+    installation token is removed as well as any URL.
+    """
+    cleaned = re.sub(r"https?://\S+", "<REDACTED_URL>", text)
+    if secret:
+        cleaned = cleaned.replace(secret, "<REDACTED_TOKEN>")
+    return cleaned
 
 
 def update_status(phase: Phase, detail: str = "") -> None:
@@ -66,7 +78,14 @@ def run(args: list[str], *, input_text: str | None = None, timeout: int = 300) -
         },
     )
     if result.returncode:
-        raise RuntimeError(f"command failed ({args[0]}, rc={result.returncode})")
+        # Vendor scripts explain themselves on stderr. Without it a failure
+        # reaches the console as a bare exit code and cannot be diagnosed
+        # without shell access to the host, which is the whole point of
+        # reporting status through the state directory.
+        output = (result.stderr or result.stdout or "").strip().splitlines()
+        tail = " | ".join(line.strip() for line in output[-5:] if line.strip())
+        detail = f": {tail}" if tail else ""
+        raise RuntimeError(f"command failed ({args[0]}, rc={result.returncode}){detail}")
     return result.stdout
 
 
@@ -99,13 +118,8 @@ def get_url(url: str, timeout: int = 10, limit: int = 1_048_576) -> tuple[str, s
         return data.decode("utf-8", errors="strict"), response.headers.get_content_type()
 
 
-def native_public_ip() -> ipaddress.IPv4Address:
-    """Return the instance's public IPv4 address, waiting for the Elastic IP association.
-
-    The instance launches without an auto-assigned public IP; CloudFormation
-    associates the pre-provisioned Elastic IP as a separate resource that can
-    complete slightly after boot starts, so IMDS may 404 briefly until then.
-    """
+def _aws_public_ip() -> str:
+    """Read the public IPv4 address from the EC2 instance metadata service."""
     token_request = urllib.request.Request(
         "http://169.254.169.254/latest/api/token",
         method="PUT",
@@ -119,17 +133,55 @@ def native_public_ip() -> ipaddress.IPv4Address:
         "http://169.254.169.254/latest/meta-data/public-ipv4",
         headers={"X-aws-ec2-metadata-token": token},
     )
+    with urllib.request.urlopen(  # noqa: S310  # nosec B310
+        request, timeout=2
+    ) as response:
+        address: str = response.read().decode().strip()
+    return address
+
+
+def _gcp_public_ip() -> str:
+    """Read the external IPv4 address from the Compute Engine metadata server.
+
+    GCP exposes the address under the interface's access config rather than as
+    a top-level key, and refuses any request that omits the Metadata-Flavor
+    header, so this cannot share a code path with the EC2 lookup.
+    """
+    request = urllib.request.Request(
+        "http://metadata.google.internal/computeMetadata/v1"
+        "/instance/network-interfaces/0/access-configs/0/external-ip",
+        headers={"Metadata-Flavor": "Google"},
+    )
+    with urllib.request.urlopen(  # noqa: S310  # nosec B310
+        request, timeout=2
+    ) as response:
+        address: str = response.read().decode().strip()
+    return address
+
+
+# Tried in order until one answers. Each fails fast on the wrong cloud: the EC2
+# token endpoint does not exist on GCP, and metadata.google.internal does not
+# resolve on EC2.
+METADATA_PROVIDERS = (_aws_public_ip, _gcp_public_ip)
+
+
+def native_public_ip() -> ipaddress.IPv4Address:
+    """Return the instance's public IPv4 address, whichever cloud it booted on.
+
+    On AWS the address arrives with the Elastic IP that UserData associates
+    after boot, so the metadata service may 404 briefly until then. On GCP the
+    reserved static address is attached at creation and answers immediately.
+    Both are polled the same way so a slow association never fails the boot.
+    """
     last_exc: Exception | None = None
     for attempt in range(12):
-        try:
-            with urllib.request.urlopen(  # noqa: S310  # nosec B310
-                request, timeout=2
-            ) as response:
-                return ipaddress.IPv4Address(response.read().decode().strip())
-        except urllib.error.HTTPError as exc:
-            last_exc = exc
-            if attempt < 11:
-                time.sleep(5)
+        for provider in METADATA_PROVIDERS:
+            try:
+                return ipaddress.IPv4Address(provider())
+            except Exception as exc:  # noqa: BLE001 - wrong cloud or not ready yet
+                last_exc = exc
+        if attempt < 11:
+            time.sleep(5)
     raise RuntimeError("no public IPv4 address associated with this instance") from last_exc
 
 
@@ -173,7 +225,11 @@ def install_agent(settings: Settings, token: str, pac_url: str) -> None:
     if Path("/usr/bin/te-agent").exists() or Path("/usr/sbin/te-agent").exists():
         run(["/usr/bin/systemctl", "enable", "--now", "te-agent.service"])
         return
-    installer = Path("/run/install_thousandeyes.sh")
+    # Not /run: that is a tmpfs mounted noexec on Debian, so the downloaded
+    # installer cannot be executed from there. The state directory is on the
+    # root filesystem on every image this runs on, and is already root-only.
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    installer = STATE_DIR / "install_thousandeyes.sh"
     body, _ = get_url("https://downloads.thousandeyes.com/agent/install_thousandeyes.sh")
     installer.write_text(body, encoding="utf-8")
     installer.chmod(0o700)
@@ -220,7 +276,7 @@ def main() -> int:
             stderr=subprocess.DEVNULL,
             check=False,
         )
-        update_status(Phase.FAILED, re.sub(r"https?://\S+", "<REDACTED_URL>", str(exc)))
+        update_status(Phase.FAILED, redact(str(exc), settings.thousandeyes_token))
         # Keep a full traceback for post-mortem via SSM. Signal the failure
         # immediately rather than stalling: the most common failure is a PAC
         # fetch from an Elastic IP not yet registered in Cisco Secure Access,
