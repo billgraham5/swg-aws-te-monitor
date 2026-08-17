@@ -205,7 +205,11 @@ def install_agent(settings: Settings, token: str, pac_url: str) -> None:
     if Path("/usr/bin/te-agent").exists() or Path("/usr/sbin/te-agent").exists():
         run(["/usr/bin/systemctl", "enable", "--now", "te-agent.service"])
         return
-    installer = Path("/run/install_thousandeyes.sh")
+    # Not /run: that is a tmpfs mounted noexec on Debian, so the downloaded
+    # installer cannot be executed from there. The state directory is on the
+    # root filesystem on every image this runs on, and is already root-only.
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    installer = STATE_DIR / "install_thousandeyes.sh"
     body, _ = get_url("https://downloads.thousandeyes.com/agent/install_thousandeyes.sh")
     installer.write_text(body, encoding="utf-8")
     installer.chmod(0o700)
