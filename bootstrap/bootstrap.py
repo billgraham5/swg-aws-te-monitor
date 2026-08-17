@@ -11,7 +11,6 @@ import subprocess  # nosec B404
 import sys
 import time
 import traceback
-import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from enum import Enum
@@ -99,13 +98,8 @@ def get_url(url: str, timeout: int = 10, limit: int = 1_048_576) -> tuple[str, s
         return data.decode("utf-8", errors="strict"), response.headers.get_content_type()
 
 
-def native_public_ip() -> ipaddress.IPv4Address:
-    """Return the instance's public IPv4 address, waiting for the Elastic IP association.
-
-    The instance launches without an auto-assigned public IP; CloudFormation
-    associates the pre-provisioned Elastic IP as a separate resource that can
-    complete slightly after boot starts, so IMDS may 404 briefly until then.
-    """
+def _aws_public_ip() -> str:
+    """Read the public IPv4 address from the EC2 instance metadata service."""
     token_request = urllib.request.Request(
         "http://169.254.169.254/latest/api/token",
         method="PUT",
@@ -119,17 +113,55 @@ def native_public_ip() -> ipaddress.IPv4Address:
         "http://169.254.169.254/latest/meta-data/public-ipv4",
         headers={"X-aws-ec2-metadata-token": token},
     )
+    with urllib.request.urlopen(  # noqa: S310  # nosec B310
+        request, timeout=2
+    ) as response:
+        address: str = response.read().decode().strip()
+    return address
+
+
+def _gcp_public_ip() -> str:
+    """Read the external IPv4 address from the Compute Engine metadata server.
+
+    GCP exposes the address under the interface's access config rather than as
+    a top-level key, and refuses any request that omits the Metadata-Flavor
+    header, so this cannot share a code path with the EC2 lookup.
+    """
+    request = urllib.request.Request(
+        "http://metadata.google.internal/computeMetadata/v1"
+        "/instance/network-interfaces/0/access-configs/0/external-ip",
+        headers={"Metadata-Flavor": "Google"},
+    )
+    with urllib.request.urlopen(  # noqa: S310  # nosec B310
+        request, timeout=2
+    ) as response:
+        address: str = response.read().decode().strip()
+    return address
+
+
+# Tried in order until one answers. Each fails fast on the wrong cloud: the EC2
+# token endpoint does not exist on GCP, and metadata.google.internal does not
+# resolve on EC2.
+METADATA_PROVIDERS = (_aws_public_ip, _gcp_public_ip)
+
+
+def native_public_ip() -> ipaddress.IPv4Address:
+    """Return the instance's public IPv4 address, whichever cloud it booted on.
+
+    On AWS the address arrives with the Elastic IP that UserData associates
+    after boot, so the metadata service may 404 briefly until then. On GCP the
+    reserved static address is attached at creation and answers immediately.
+    Both are polled the same way so a slow association never fails the boot.
+    """
     last_exc: Exception | None = None
     for attempt in range(12):
-        try:
-            with urllib.request.urlopen(  # noqa: S310  # nosec B310
-                request, timeout=2
-            ) as response:
-                return ipaddress.IPv4Address(response.read().decode().strip())
-        except urllib.error.HTTPError as exc:
-            last_exc = exc
-            if attempt < 11:
-                time.sleep(5)
+        for provider in METADATA_PROVIDERS:
+            try:
+                return ipaddress.IPv4Address(provider())
+            except Exception as exc:  # noqa: BLE001 - wrong cloud or not ready yet
+                last_exc = exc
+        if attempt < 11:
+            time.sleep(5)
     raise RuntimeError("no public IPv4 address associated with this instance") from last_exc
 
 
