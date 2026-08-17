@@ -110,3 +110,18 @@ def test_public_ip_retries_then_reports_no_address(monkeypatch: pytest.MonkeyPat
         bootstrap.native_public_ip()
     assert len(attempts) == 12
     assert sleeps == [5] * 11
+
+
+def test_run_reports_stderr_so_a_failure_can_be_diagnosed() -> None:
+    """A bare exit code is not diagnosable from the console; the tail must survive."""
+    with pytest.raises(RuntimeError, match="Unsupported operating system"):
+        bootstrap.run(["/bin/sh", "-c", "echo 'Unsupported operating system' >&2; exit 1"])
+
+
+def test_redact_removes_the_token_and_urls() -> None:
+    """Vendor stderr is echoed to the console, so it must not carry the token."""
+    text = "installer failed for https://proxy.example.invalid/p.pac using tok3nvalue"
+    cleaned = bootstrap.redact(text, "tok3nvalue")
+    assert "tok3nvalue" not in cleaned
+    assert "proxy.example.invalid" not in cleaned
+    assert "<REDACTED_TOKEN>" in cleaned and "<REDACTED_URL>" in cleaned

@@ -944,10 +944,35 @@ def _regional_parameters(
     return [{"ParameterKey": key, "ParameterValue": value} for key, value in values.items()]
 
 
-LIVE_STACK_STATUSES = frozenset({"CREATE_COMPLETE", "UPDATE_COMPLETE", "UPDATE_ROLLBACK_COMPLETE"})
+LIVE_STACK_STATUSES = frozenset(
+    {
+        "CREATE_COMPLETE",
+        "UPDATE_COMPLETE",
+        "UPDATE_ROLLBACK_COMPLETE",
+        # A stack in cleanup has already reached its new state and is only
+        # discarding resources the update replaced. It is standing, and its
+        # parameters are the ones now deployed. Treating these as "not live"
+        # blanks every slot in the Region and deletes the running locations.
+        "UPDATE_COMPLETE_CLEANUP_IN_PROGRESS",
+        "UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS",
+    }
+)
+
+# Nothing usable is standing, so carrying nothing forward is correct.
+GONE_STACK_STATUSES = frozenset(
+    {
+        "DELETE_COMPLETE",
+        "DELETE_FAILED",
+        "CREATE_FAILED",
+        "ROLLBACK_COMPLETE",
+        "ROLLBACK_FAILED",
+    }
+)
 
 
-def _deployed_regional_values(cfn: Any, stack_id: str) -> dict[str, str]:
+def _deployed_regional_values(
+    cfn: Any, stack_id: str, *, attempts: int = 60, delay: int = 10
+) -> dict[str, str]:
     """Read the parameters a region's bundle stack is currently deployed with.
 
     Only a stack that is actually standing has values worth carrying forward.
@@ -956,14 +981,35 @@ def _deployed_regional_values(cfn: Any, stack_id: str) -> dict[str, str]:
     re-creates a location that never deployed, using the settings that failed
     it, and one failed slot rolls back the whole Region including the locations
     being deployed alongside it.
+
+    Anything still moving is waited out rather than read. A stack mid-update
+    may report parameters belonging to neither the old nor the new state, and
+    an unreadable answer must never become an empty one: a blank slot clears
+    its condition and deletes whatever is running in it. When the state cannot
+    be established this refuses instead, because refusing costs a re-run and
+    guessing costs a production agent.
     """
-    try:
-        stack = cfn.describe_stacks(StackName=stack_id)["Stacks"][0]
-    except ClientError:
-        return {}
-    if stack.get("StackStatus") not in LIVE_STACK_STATUSES:
-        return {}
-    return {
-        parameter["ParameterKey"]: parameter.get("ParameterValue", "")
-        for parameter in stack.get("Parameters", [])
-    }
+    for attempt in range(attempts):
+        try:
+            stack = cfn.describe_stacks(StackName=stack_id)["Stacks"][0]
+        except ClientError:
+            return {}
+        status = str(stack.get("StackStatus", ""))
+        if status in LIVE_STACK_STATUSES:
+            return {
+                parameter["ParameterKey"]: parameter.get("ParameterValue", "")
+                for parameter in stack.get("Parameters", [])
+            }
+        if status in GONE_STACK_STATUSES:
+            return {}
+        if not status.endswith("_IN_PROGRESS"):
+            raise RuntimeError(
+                f"{stack_id} is {status}, which is not a state this can safely carry "
+                "forward from; re-run once the stack has settled"
+            )
+        if attempt < attempts - 1:
+            time.sleep(delay)
+    raise RuntimeError(
+        f"{stack_id} was still in progress after {attempts * delay}s; re-run once it settles "
+        "rather than deploying against an unknown state"
+    )

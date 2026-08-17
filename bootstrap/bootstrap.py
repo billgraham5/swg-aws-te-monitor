@@ -38,6 +38,19 @@ class Settings:
     agent_name: str
 
 
+def redact(text: str, secret: str) -> str:
+    """Strip secrets from a string before it is written somewhere readable.
+
+    Failure detail now carries the tail of a vendor script's stderr, which is
+    not under our control and can echo back the arguments it was given, so the
+    installation token is removed as well as any URL.
+    """
+    cleaned = re.sub(r"https?://\S+", "<REDACTED_URL>", text)
+    if secret:
+        cleaned = cleaned.replace(secret, "<REDACTED_TOKEN>")
+    return cleaned
+
+
 def update_status(phase: Phase, detail: str = "") -> None:
     STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     payload = {"phase": phase.value, "detail": detail, "updated": int(time.time())}
@@ -65,7 +78,14 @@ def run(args: list[str], *, input_text: str | None = None, timeout: int = 300) -
         },
     )
     if result.returncode:
-        raise RuntimeError(f"command failed ({args[0]}, rc={result.returncode})")
+        # Vendor scripts explain themselves on stderr. Without it a failure
+        # reaches the console as a bare exit code and cannot be diagnosed
+        # without shell access to the host, which is the whole point of
+        # reporting status through the state directory.
+        output = (result.stderr or result.stdout or "").strip().splitlines()
+        tail = " | ".join(line.strip() for line in output[-5:] if line.strip())
+        detail = f": {tail}" if tail else ""
+        raise RuntimeError(f"command failed ({args[0]}, rc={result.returncode}){detail}")
     return result.stdout
 
 
@@ -256,7 +276,7 @@ def main() -> int:
             stderr=subprocess.DEVNULL,
             check=False,
         )
-        update_status(Phase.FAILED, re.sub(r"https?://\S+", "<REDACTED_URL>", str(exc)))
+        update_status(Phase.FAILED, redact(str(exc), settings.thousandeyes_token))
         # Keep a full traceback for post-mortem via SSM. Signal the failure
         # immediately rather than stalling: the most common failure is a PAC
         # fetch from an Elastic IP not yet registered in Cisco Secure Access,
